@@ -1,0 +1,11 @@
+{
+  "name": "isbusy-code",
+  "displayName": "isbusy code",
+  "version": "0.1.0",
+  "description": "Drives an isbusy code light: green when Claude Code is ready, yellow while it works, red when it needs you.",
+  "author": { "name": "isbusy", "url": "https://isbusy.co" },
+  "homepage": "https://code.isbusy.co",
+  "repository": "https://github.com/berkaycubuk/isbusy-code",
+  "license": "MIT",
+  "keywords": ["status", "light", "hardware", "notifications"]
+}

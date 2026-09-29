@@ -1,0 +1,97 @@
+#!/bin/sh
+# isbusy code: tell the light on your desk what Claude Code is doing.
+#
+#   isbusy-code link XXXXX-XXXXX   spend a pairing code from code.isbusy.co/setup
+#   isbusy-code unlink             forget this computer's key
+#   isbusy-code status             is this computer linked?
+#   isbusy-code hook <event>       what the plugin's hooks run; not for people
+#
+# What leaves this computer: the event name (start, prompt, tool, attention,
+# stop, end) and Claude Code's session id. Nothing else from the hook's input -
+# no prompts, no file paths, no tool names - is read or sent.
+#
+# State lives in ~/.config/isbusy-code/: `key` (mode 600) and `url`.
+# ISBUSY_CODE_URL overrides the relay, for a bench setup.
+
+set -u
+DIR="${XDG_CONFIG_HOME:-$HOME/.config}/isbusy-code"
+DEFAULT_URL="https://code.isbusy.co"
+
+url() {
+  if [ -n "${ISBUSY_CODE_URL:-}" ]; then printf %s "$ISBUSY_CODE_URL"
+  elif [ -f "$DIR/url" ]; then cat "$DIR/url"
+  else printf %s "$DEFAULT_URL"; fi
+}
+
+# The one field wanted from a JSON body, without needing jq. Values here are
+# ids and keys: no quotes or escapes inside them.
+field() {
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
+}
+
+cmd_hook() {
+  event="${1:-}"
+  # Always drain stdin: a writer whose reader goes away gets SIGPIPE, and
+  # Claude Code should never see this hook fail.
+  input=$(cat)
+  [ -f "$DIR/key" ] || exit 0
+  session=$(printf %s "$input" | field session_id)
+  [ -n "$session" ] || exit 0
+  key=$(cat "$DIR/key")
+  base=$(url)
+  # Fire and forget: a slow network must never make Claude wait on a lamp.
+  (curl -fsS --max-time 3 -o /dev/null \
+     -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+     -d "{\"session\":\"$session\",\"event\":\"$event\"}" \
+     "$base/api/v1/event" >/dev/null 2>&1 &) </dev/null >/dev/null 2>&1
+  exit 0
+}
+
+cmd_link() {
+  token="${1:-}"
+  if [ -z "$token" ]; then
+    echo "Usage: /isbusy-code:link XXXXX-XXXXX  (get a code at $(url)/setup)"
+    exit 1
+  fi
+  base=$(url)
+  label=$(hostname 2>/dev/null || echo computer)
+  reply=$(curl -sS --max-time 15 -w '\n%{http_code}' -H "Content-Type: application/json" \
+    -d "{\"token\":\"$token\",\"label\":\"$label\"}" "$base/api/v1/link") || {
+    echo "Could not reach $base. Check your connection and try again."
+    exit 1
+  }
+  code=$(printf %s "$reply" | tail -n 1)
+  body=$(printf %s "$reply" | sed '$d')
+  if [ "$code" != "200" ]; then
+    err=$(printf %s "$body" | field error)
+    echo "Link failed: ${err:-HTTP $code}. Get a fresh code at $base/setup."
+    exit 1
+  fi
+  key=$(printf %s "$body" | field key)
+  name=$(printf %s "$body" | field name)
+  mkdir -p "$DIR" && chmod 700 "$DIR"
+  (umask 077 && printf %s "$key" > "$DIR/key")
+  printf %s "$base" > "$DIR/url"
+  echo "Linked to $name. It turns green in new Claude Code sessions; this one catches up on the next prompt."
+}
+
+cmd_unlink() {
+  if [ ! -f "$DIR/key" ]; then echo "This computer is not linked."; exit 0; fi
+  curl -fsS --max-time 10 -o /dev/null -X POST -H "Authorization: Bearer $(cat "$DIR/key")" \
+    "$(url)/api/v1/unlink" 2>/dev/null
+  rm -f "$DIR/key"
+  echo "Unlinked. This computer no longer drives the light."
+}
+
+cmd_status() {
+  if [ -f "$DIR/key" ]; then echo "Linked, reporting to $(url)."
+  else echo "Not linked. Get a code at $(url)/setup, then /isbusy-code:link <code>."; fi
+}
+
+case "${1:-}" in
+  hook)   shift; cmd_hook "$@" ;;
+  link)   shift; cmd_link "$@" ;;
+  unlink) cmd_unlink ;;
+  status) cmd_status ;;
+  *) echo "usage: isbusy-code link <code> | unlink | status"; exit 1 ;;
+esac

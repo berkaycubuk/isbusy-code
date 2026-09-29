@@ -1,0 +1,16 @@
+{
+  "name": "isbusy",
+  "description": "isbusy's plugins for Claude Code.",
+  "owner": {
+    "name": "isbusy",
+    "url": "https://isbusy.co"
+  },
+  "plugins": [
+    {
+      "name": "isbusy-code",
+      "source": "./",
+      "description": "Drives an isbusy code light from your Claude Code sessions.",
+      "version": "0.1.0"
+    }
+  ]
+}
