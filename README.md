@@ -52,7 +52,10 @@ acting on it.
 For the light, only two things go to `code.isbusy.co`: the name of the event
 (`start`, `prompt`, `tool`, `attention`, `stop`, `end`) and Claude Code's
 session id. The hook's input - your prompts, file paths, tool names - is read
-for the session id and nothing else.
+for the session id and nothing else. With a phone paired, the project folder's
+name goes along when a session starts, takes a prompt or stops, sealed like a
+permission request: a phone with a screen to spare (a Game HAT) lists your
+sessions by it, and the relay cannot read it.
 
 With a phone paired, a permission request also goes to your phone: the tool's
 name, what it wants to run or touch (the command, file or URL, cut to 700

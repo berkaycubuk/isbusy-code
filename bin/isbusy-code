@@ -12,7 +12,8 @@
 #
 # What leaves this computer for the light: the event name (start, prompt,
 # tool, attention, stop, end) and Claude Code's session id. Nothing else from
-# the hook's input - no prompts, no file paths, no tool names.
+# the hook's input - no prompts, no file paths, no tool names. With a phone
+# paired, the project folder's name too, sealed for the phones like a request.
 #
 # With a phone paired, a permission request also goes to the phone: the tool,
 # what it wants to run or touch, and the project folder's name - or, when
@@ -56,10 +57,21 @@ cmd_hook() {
   key=$(cat "$DIR/key")
   base=$(url)
   # Fire and forget: a slow network must never make Claude wait on a lamp.
-  (curl -fsS --max-time 3 -o /dev/null \
-     -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
-     -d "{\"session\":\"$session\",\"event\":\"$event\"}" \
-     "$base/api/v1/event" >/dev/null 2>&1 &) </dev/null >/dev/null 2>&1
+  # With a phone paired, the project folder's name goes too, sealed, so a
+  # phone with a screen (the Game HAT) can name the session; on the events
+  # that start a turn or end one, not on every tool call.
+  cwd=$(printf %s "$input" | field cwd)
+  ({
+    label=""
+    case $event in start|prompt|stop)
+      dir=$(printf %s "${cwd##*/}" | cut -c 1-60)
+      [ -f "$DIR/phone" ] && [ -n "$dir" ] && label=$(printf '{"dir":"%s"}' "$dir" | seal "$(cat "$DIR/phone")" session)
+    esac
+    curl -fsS --max-time 3 -o /dev/null \
+      -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+      -d "{\"session\":\"$session\",\"event\":\"$event\",\"label\":\"$label\"}" \
+      "$base/api/v1/event"
+  } >/dev/null 2>&1 &) </dev/null >/dev/null 2>&1
   exit 0
 }
 
