@@ -265,14 +265,18 @@ cmd_phone() {
     qrencode -t ansiutf8 "$payload"
   fi
   # A page on this disk, never served: the QR code carries the sealing key.
+  # It reloads itself every two seconds, so once the phone has paired and
+  # this overwrites it, the browser shows that instead - a script may not
+  # close a tab it did not open.
   page="$DIR/pair.html"
+  style='body{font:16px system-ui,sans-serif;background:#15171a;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0;text-align:center}
+#qr{background:#fff;padding:16px;border-radius:12px;display:inline-block}#qr img{display:block;width:320px;height:320px;image-rendering:pixelated}'
   (umask 077 && {
     cat <<EOF
-<!doctype html><meta charset="utf-8"><title>Pair a phone · isbusy code</title>
-<style>body{font:16px system-ui,sans-serif;background:#15171a;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0;text-align:center}
-#qr{background:#fff;padding:16px;border-radius:12px;display:inline-block}#qr img{display:block;width:320px;height:320px;image-rendering:pixelated}</style>
+<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="2"><title>Pair a phone · isbusy code</title>
+<style>$style</style>
 <div><div id="qr"></div><p>In the isbusy code app, tap <b>Pair a computer</b> and scan this.</p>
-<p style="color:#999">Works once, for 15 minutes. This page deletes itself from disk then.</p></div>
+<p style="color:#999">Works once, for 15 minutes.</p></div>
 <script>
 EOF
     cat "$ROOT/web/qrcode.js"
@@ -287,7 +291,25 @@ EOF
   if command -v open >/dev/null 2>&1; then open "$page"
   elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$page" >/dev/null 2>&1
   fi
-  echo "Opened a QR code in your browser ($page). In the isbusy code app, tap Pair a computer and scan it. It works once, for 15 minutes."
+
+  # Wait for the phone, so whoever ran this hears that it worked. Not the
+  # code's whole fifteen minutes: Claude Code waits on this command.
+  key=$(cat "$DIR/key")
+  deadline=$(($(date +%s) + 90))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    state=$(curl -sS --max-time 5 -H "Authorization: Bearer $key" "$base/api/v1/phones/invite/$code" 2>/dev/null)
+    case $state in
+      *'"paired":true'*)
+        phone=$(printf %s "$state" | field phone)
+        (umask 077 && printf '%s\n' '<!doctype html><meta charset="utf-8"><title>Paired · isbusy code</title>' \
+          "<style>$style</style>" \
+          "<div><p style=\"font-size:48px;margin:0\">✓</p><p>Paired with <b>${phone:-your phone}</b>.</p><p style=\"color:#999\">You can close this tab.</p></div>" > "$page")
+        echo "Paired with ${phone:-your phone}. Permission prompts from this computer now go there too, and to the watch beside it."
+        exit 0 ;;
+    esac
+    sleep 2
+  done
+  echo "Opened a QR code in your browser ($page). In the isbusy code app, tap Pair a computer and scan it - it works once, for 15 minutes. /isbusy-code:phone again shows a fresh one."
 }
 
 cmd_unlink() {

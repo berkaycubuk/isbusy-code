@@ -1,7 +1,7 @@
 {
   "name": "isbusy-code",
   "displayName": "isbusy code",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Drives an isbusy code light: green when Claude Code is ready, yellow while it works, red when it needs you. Answer permission prompts from your phone and watch.",
   "author": { "name": "isbusy", "url": "https://isbusy.co" },
   "homepage": "https://code.isbusy.co",
