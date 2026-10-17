@@ -21,6 +21,11 @@ permission prompt also reaches your phone, and through it your watch, with
 the whole time; whichever you answer first wins, and the other one goes away.
 No light needed.
 
+When Claude asks you something instead (its multiple-choice questions), the
+phone shows one question at a time with its options as choices - chips on the
+phone, a list on the watch - plus voice or keyboard for an answer of your own,
+and **Skip**. The answers reach Claude as if picked in the terminal.
+
 A reason reaches Claude as the reason for the denial, not as an instruction:
 Claude Code treats it like any other tool result and will ask you before
 acting on it.
@@ -34,7 +39,8 @@ for the session id and nothing else.
 
 With a phone paired, a permission request also goes to your phone: the tool's
 name, what it wants to run or touch (the command, file or URL, cut to 700
-characters), its description, and the project folder's name. It is sealed
+characters), its description, and the project folder's name; for a question, the questions
+and their option labels instead (not the descriptions). It is sealed
 with a key that only this computer and your phone hold - it reaches the phone
 inside the QR code, never through the relay - so `code.isbusy.co` passes it
 on without being able to read it, and cannot forge an answer: this computer

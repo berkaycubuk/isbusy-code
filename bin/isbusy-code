@@ -14,7 +14,8 @@
 # the hook's input - no prompts, no file paths, no tool names.
 #
 # With a phone paired, a permission request also goes to the phone: the tool,
-# what it wants to run or touch, and the project folder's name. Sealed with a
+# what it wants to run or touch, and the project folder's name - or, when
+# Claude asks you something, the questions and their options. Sealed with a
 # key only this computer and your phone hold (it reaches the phone in the QR
 # code, never through the relay), so the relay carries it without being able
 # to read it, and cannot forge an answer to it.
@@ -127,17 +128,31 @@ cmd_decide() {
   secret=$(cat "$DIR/phone")
   base=$(url)
   nonce=$(openssl rand -hex 16)
-  plain=$(printf %s "$input" | jq -c --arg n "$nonce" '{
+  # AskUserQuestion is a question, not a permission: its questions and their
+  # option labels go instead of `what`, so the phone can offer them as answers.
+  # Descriptions stay behind - a watch has no room, and a request has a size.
+  plain=$(printf %s "$input" | jq -c --arg n "$nonce" '
+    (.tool_name == "AskUserQuestion" and (.tool_input.questions | type) == "array") as $ask
+    | {
       v: 1,
       n: $n,
       tool: (.tool_name // "a tool"),
-      what: ((.tool_input.command // .tool_input.file_path // .tool_input.url
-              // .tool_input.pattern // .tool_input.query // (.tool_input | tostring))
-             | tostring | .[0:700]),
+      what: (if $ask then "" else
+              (.tool_input.command // .tool_input.file_path // .tool_input.url
+               // .tool_input.pattern // .tool_input.query // (.tool_input | tostring))
+              | tostring | .[0:700] end),
       why: ((.tool_input.description // "") | tostring | .[0:200]),
       dir: ((.cwd // "") | split("/") | last // ""),
       t: (now | floor)
-    }' 2>/dev/null) || exit 0
+    }
+    + if $ask then {q: [.tool_input.questions[] | {
+        q: ((.question // "") | tostring | .[0:200]),
+        h: ((.header // "") | tostring | .[0:20]),
+        o: [(.options // [])[] | (.label // "") | tostring | .[0:60]],
+        m: (.multiSelect == true)
+      }]} else {} end' 2>/dev/null) || exit 0
+  # The relay takes 3000 bytes sealed; past this the terminal keeps it.
+  [ "$(printf %s "$plain" | wc -c)" -le 2000 ] || exit 0
   sealed=$(printf %s "$plain" | seal "$secret" req) || exit 0
 
   reply=$(curl -sS --max-time 5 -w '\n%{http_code}' \
@@ -186,14 +201,29 @@ cmd_decide() {
   trap - TERM INT HUP
   plain=$(unseal "$secret" "ans.$nonce" "$answer") || exit 0
   [ "$(printf %s "$plain" | jq -r '.n // empty')" = "$nonce" ] || exit 0
+  tool=$(printf %s "$input" | jq -r '.tool_name // empty')
   case $(printf %s "$plain" | jq -r '.b // empty') in
     allow)
-      printf %s '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}' ;;
+      if [ "$tool" = AskUserQuestion ]; then
+        # The phone answers by position, `a`, one per question; Claude Code
+        # wants them keyed by the question's own text. Short of one per
+        # question (an app that only knows Allow), the terminal keeps it.
+        printf %s "$input" | jq -c --argjson p "$plain" '
+          .tool_input as $in
+          | select(($p.a | type) == "array" and ($p.a | length) == ($in.questions | length))
+          | {hookSpecificOutput: {hookEventName: "PermissionRequest", decision: {
+              behavior: "allow",
+              updatedInput: ($in + {answers: ([$in.questions, $p.a] | transpose
+                | map({key: .[0].question, value: (.[1] | tostring)}) | from_entries)})}}}' 2>/dev/null
+      else
+        printf %s '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
+      fi ;;
     deny)
-      printf %s "$plain" | jq -c '{hookSpecificOutput: {hookEventName: "PermissionRequest", decision: {
+      printf %s "$plain" | jq -c --arg tool "$tool" '{hookSpecificOutput: {hookEventName: "PermissionRequest", decision: {
           behavior: "deny",
-          message: (if (.m // "") == "" then "The user denied this from their phone."
-                    else "The user answered from their phone: " + .m end)}}}' ;;
+          message: (if (.m // "") != "" then "The user answered from their phone: " + .m
+                    elif $tool == "AskUserQuestion" then "The user skipped these questions from their phone."
+                    else "The user denied this from their phone." end)}}}' ;;
   esac
   exit 0
 }
