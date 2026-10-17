@@ -1,5 +1,5 @@
 {
-  "description": "Report Claude Code's state to the isbusy code light. Only the event name and session id leave this computer.",
+  "description": "Report Claude Code's state to the isbusy code light (only the event name and session id), and send permission prompts to a paired phone, sealed end to end.",
   "hooks": {
     "SessionStart": [
       {
@@ -60,6 +60,11 @@
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/isbusy-code\" hook attention",
             "timeout": 5,
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/isbusy-code\" decide",
+            "timeout": 600
           }
         ]
       }

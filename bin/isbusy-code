@@ -1,20 +1,30 @@
 #!/bin/sh
-# isbusy code: tell the light on your desk what Claude Code is doing.
+# isbusy code: tell the light on your desk what Claude Code is doing, and let
+# your phone (and the watch on your wrist) answer its permission prompts.
 #
 #   isbusy-code link XXXXX-XXXXX   spend a pairing code from code.isbusy.co/setup
+#   isbusy-code phone              pair a phone: shows a QR code for the app
 #   isbusy-code unlink             forget this computer's key
 #   isbusy-code status             is this computer linked?
 #   isbusy-code hook <event>       what the plugin's hooks run; not for people
+#   isbusy-code decide             the permission hook; not for people
 #
-# What leaves this computer: the event name (start, prompt, tool, attention,
-# stop, end) and Claude Code's session id. Nothing else from the hook's input -
-# no prompts, no file paths, no tool names - is read or sent.
+# What leaves this computer for the light: the event name (start, prompt,
+# tool, attention, stop, end) and Claude Code's session id. Nothing else from
+# the hook's input - no prompts, no file paths, no tool names.
 #
-# State lives in ~/.config/isbusy-code/: `key` (mode 600) and `url`.
-# ISBUSY_CODE_URL overrides the relay, for a bench setup.
+# With a phone paired, a permission request also goes to the phone: the tool,
+# what it wants to run or touch, and the project folder's name. Sealed with a
+# key only this computer and your phone hold (it reaches the phone in the QR
+# code, never through the relay), so the relay carries it without being able
+# to read it, and cannot forge an answer to it.
+#
+# State lives in ~/.config/isbusy-code/: `key` (mode 600), `url`, and `phone`
+# (the sealing key, mode 600). ISBUSY_CODE_URL overrides the relay.
 
 set -u
 DIR="${XDG_CONFIG_HOME:-$HOME/.config}/isbusy-code"
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEFAULT_URL="https://code.isbusy.co"
 
 url() {
@@ -27,6 +37,10 @@ url() {
 # ids and keys: no quotes or escapes inside them.
 field() {
   sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
+}
+
+label() {
+  hostname 2>/dev/null | tr -cd 'A-Za-z0-9.-' | cut -c 1-40
 }
 
 cmd_hook() {
@@ -47,6 +61,145 @@ cmd_hook() {
   exit 0
 }
 
+# ---- the seal, shared with the Android app (Seal.kt), byte for byte
+#
+#   secret     32 random bytes, base64url, in $DIR/phone
+#   enc, mac   HMAC-SHA256(secret, "isbusy-code enc") and (…, "isbusy-code mac")
+#   sealed     v1.<iv>.<ct>.<tag>, base64url without padding
+#              ct  = AES-256-CBC(enc, iv, PKCS#7)(plaintext)
+#              tag = HMAC-SHA256(mac, "<aad>.v1.<iv>.<ct>")
+#   aad        "req" for a request; "ans.<nonce>" for its answer, the nonce
+#              being the request's own - so no answer fits another request.
+#
+# Only openssl, and only what the LibreSSL on a stock Mac has: no GCM in its
+# `enc`, no X25519, so CBC with HMAC over it, and a key carried by QR code.
+
+b64u() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+unb64u() {
+  s=$(tr '_-' '/+')
+  case $((${#s} % 4)) in 2) s="$s==" ;; 3) s="$s=" ;; esac
+  printf %s "$s" | openssl base64 -d -A
+}
+
+hex() { od -An -v -tx1 | tr -d ' \n'; }
+
+# derive <secret b64u> <label> -> hex key
+derive() {
+  printf %s "$2" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$(printf %s "$1" | unb64u | hex)" -binary | hex
+}
+
+# tag <mac key hex> <text> -> b64u
+tag() {
+  printf %s "$2" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$1" -binary | b64u
+}
+
+# seal <secret> <aad>, plaintext on stdin
+seal() {
+  ivb=$(openssl rand 16 | b64u)
+  ct=$(openssl enc -aes-256-cbc -K "$(derive "$1" "isbusy-code enc")" -iv "$(printf %s "$ivb" | unb64u | hex)" | b64u)
+  printf %s "v1.$ivb.$ct.$(tag "$(derive "$1" "isbusy-code mac")" "$2.v1.$ivb.$ct")"
+}
+
+# unseal <secret> <aad> <sealed> -> plaintext, or fails
+unseal() {
+  old_ifs=$IFS; IFS=.
+  set -- "$1" "$2" $3
+  IFS=$old_ifs
+  [ $# -eq 6 ] && [ "$3" = v1 ] || return 1
+  [ "$(tag "$(derive "$1" "isbusy-code mac")" "$2.v1.$4.$5")" = "$6" ] || return 1
+  printf %s "$5" | unb64u | openssl enc -d -aes-256-cbc -K "$(derive "$1" "isbusy-code enc")" -iv "$(printf %s "$4" | unb64u | hex)"
+}
+
+# ---- the permission hook
+#
+# Files the request, sealed, and waits for the phone. The terminal prompt is
+# up the whole time: answer it there and Claude Code kills this hook, which
+# withdraws the request so the watch stops showing it. Anything going wrong
+# here - no phone, no network, a bad seal - ends the same way: no output, and
+# the prompt stays the person's to answer.
+
+cmd_decide() {
+  input=$(cat)
+  [ -f "$DIR/key" ] && [ -f "$DIR/phone" ] || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+  key=$(cat "$DIR/key")
+  secret=$(cat "$DIR/phone")
+  base=$(url)
+  nonce=$(openssl rand -hex 16)
+  plain=$(printf %s "$input" | jq -c --arg n "$nonce" '{
+      v: 1,
+      n: $n,
+      tool: (.tool_name // "a tool"),
+      what: ((.tool_input.command // .tool_input.file_path // .tool_input.url
+              // .tool_input.pattern // .tool_input.query // (.tool_input | tostring))
+             | tostring | .[0:700]),
+      why: ((.tool_input.description // "") | tostring | .[0:200]),
+      dir: ((.cwd // "") | split("/") | last // ""),
+      t: (now | floor)
+    }' 2>/dev/null) || exit 0
+  sealed=$(printf %s "$plain" | seal "$secret" req) || exit 0
+
+  reply=$(curl -sS --max-time 5 -w '\n%{http_code}' \
+    -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+    -d "{\"request\":\"$sealed\"}" "$base/api/v1/decisions" 2>/dev/null) || exit 0
+  [ "$(printf %s "$reply" | tail -n 1)" = 200 ] || exit 0
+  id=$(printf %s "$reply" | sed '$d' | jq -r '.id // empty')
+  [ -n "$id" ] || exit 0
+
+  out=$(mktemp "${TMPDIR:-/tmp}/isbusy-code.XXXXXX") || exit 0
+  poll=""
+  withdraw() {
+    [ -n "$poll" ] && kill "$poll" 2>/dev/null
+    curl -s --max-time 3 -o /dev/null -X DELETE -H "Authorization: Bearer $key" "$base/api/v1/decisions/$id" 2>/dev/null
+    rm -f "$out"
+    exit 0
+  }
+  trap withdraw TERM INT HUP
+
+  # The relay keeps a request ten minutes; stop a little before it does.
+  deadline=$(($(date +%s) + 570))
+  answer=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    # In the background and waited on, so a kill lands at once rather than
+    # after a parked poll comes back.
+    curl -sS --max-time 40 -o "$out" -w '%{http_code}' -H "Authorization: Bearer $key" \
+      "$base/api/v1/decisions/$id" >"$out.code" 2>/dev/null &
+    poll=$!
+    wait "$poll"
+    poll=""
+    code=$(cat "$out.code" 2>/dev/null); rm -f "$out.code"
+    case $code in
+      200) ;;
+      404) rm -f "$out"; exit 0 ;;
+      *) sleep 2; continue ;;
+    esac
+    case $(jq -r '.state' "$out") in
+      pending) ;;
+      answered) answer=$(jq -r '.answer' "$out"); break ;;
+      *) rm -f "$out"; exit 0 ;;
+    esac
+  done
+  [ -n "$answer" ] || withdraw
+
+  rm -f "$out"
+  trap - TERM INT HUP
+  plain=$(unseal "$secret" "ans.$nonce" "$answer") || exit 0
+  [ "$(printf %s "$plain" | jq -r '.n // empty')" = "$nonce" ] || exit 0
+  case $(printf %s "$plain" | jq -r '.b // empty') in
+    allow)
+      printf %s '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}' ;;
+    deny)
+      printf %s "$plain" | jq -c '{hookSpecificOutput: {hookEventName: "PermissionRequest", decision: {
+          behavior: "deny",
+          message: (if (.m // "") == "" then "The user denied this from their phone."
+                    else "The user answered from their phone: " + .m end)}}}' ;;
+  esac
+  exit 0
+}
+
+# ---- pairing
+
 cmd_link() {
   token="${1:-}"
   if [ -z "$token" ]; then
@@ -54,9 +207,11 @@ cmd_link() {
     exit 1
   fi
   base=$(url)
-  label=$(hostname 2>/dev/null || echo computer)
-  reply=$(curl -sS --max-time 15 -w '\n%{http_code}' -H "Content-Type: application/json" \
-    -d "{\"token\":\"$token\",\"label\":\"$label\"}" "$base/api/v1/link") || {
+  # A computer already set up with a phone keeps its key, and so its phone.
+  set --
+  [ -f "$DIR/key" ] && set -- -H "Authorization: Bearer $(cat "$DIR/key")"
+  reply=$(curl -sS --max-time 15 -w '\n%{http_code}' -H "Content-Type: application/json" "$@" \
+    -d "{\"token\":\"$token\",\"label\":\"$(label)\"}" "$base/api/v1/link") || {
     echo "Could not reach $base. Check your connection and try again."
     exit 1
   }
@@ -75,23 +230,87 @@ cmd_link() {
   echo "Linked to $name. It turns green in new Claude Code sessions; this one catches up on the next prompt."
 }
 
+cmd_phone() {
+  base=$(url)
+  mkdir -p "$DIR" && chmod 700 "$DIR"
+  if [ ! -f "$DIR/key" ]; then
+    # No light: this computer gets a key of its own.
+    reply=$(curl -sS --max-time 15 -w '\n%{http_code}' -H "Content-Type: application/json" \
+      -d "{\"label\":\"$(label)\"}" "$base/api/v1/computers") || {
+      echo "Could not reach $base. Check your connection and try again."
+      exit 1
+    }
+    if [ "$(printf %s "$reply" | tail -n 1)" != 200 ]; then
+      echo "Could not set this computer up: $(printf %s "$reply" | sed '$d' | field error)"
+      exit 1
+    fi
+    (umask 077 && printf %s "$reply" | sed '$d' | field key > "$DIR/key")
+    printf %s "$base" > "$DIR/url"
+  fi
+  [ -f "$DIR/phone" ] || (umask 077 && openssl rand 32 | b64u > "$DIR/phone")
+
+  reply=$(curl -sS --max-time 15 -w '\n%{http_code}' -X POST \
+    -H "Authorization: Bearer $(cat "$DIR/key")" "$base/api/v1/phones/invite") || {
+    echo "Could not reach $base. Check your connection and try again."
+    exit 1
+  }
+  if [ "$(printf %s "$reply" | tail -n 1)" != 200 ]; then
+    echo "The relay refused: $(printf %s "$reply" | sed '$d' | field error). Try /isbusy-code:unlink, then pair again."
+    exit 1
+  fi
+  code=$(printf %s "$reply" | sed '$d' | field code)
+  payload="isbusy-code:pair?u=$base&c=$code&k=$(cat "$DIR/phone")&n=$(label)"
+
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ansiutf8 "$payload"
+  fi
+  # A page on this disk, never served: the QR code carries the sealing key.
+  page="$DIR/pair.html"
+  (umask 077 && {
+    cat <<EOF
+<!doctype html><meta charset="utf-8"><title>Pair a phone · isbusy code</title>
+<style>body{font:16px system-ui,sans-serif;background:#15171a;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0;text-align:center}
+#qr{background:#fff;padding:16px;border-radius:12px;display:inline-block}#qr img{display:block;width:320px;height:320px;image-rendering:pixelated}</style>
+<div><div id="qr"></div><p>In the isbusy code app, tap <b>Pair a computer</b> and scan this.</p>
+<p style="color:#999">Works once, for 15 minutes. This page deletes itself from disk then.</p></div>
+<script>
+EOF
+    cat "$ROOT/web/qrcode.js"
+    cat <<EOF
+</script><script>
+var q = qrcode(0, "M"); q.addData("$payload"); q.make();
+document.getElementById("qr").innerHTML = q.createImgTag(8, 0);
+</script>
+EOF
+  } > "$page")
+  (sleep 900; rm -f "$page") </dev/null >/dev/null 2>&1 &
+  if command -v open >/dev/null 2>&1; then open "$page"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$page" >/dev/null 2>&1
+  fi
+  echo "Opened a QR code in your browser ($page). In the isbusy code app, tap Pair a computer and scan it. It works once, for 15 minutes."
+}
+
 cmd_unlink() {
   if [ ! -f "$DIR/key" ]; then echo "This computer is not linked."; exit 0; fi
   curl -fsS --max-time 10 -o /dev/null -X POST -H "Authorization: Bearer $(cat "$DIR/key")" \
     "$(url)/api/v1/unlink" 2>/dev/null
-  rm -f "$DIR/key"
-  echo "Unlinked. This computer no longer drives the light."
+  rm -f "$DIR/key" "$DIR/phone" "$DIR/pair.html"
+  echo "Unlinked. This computer no longer drives the light or asks your phone."
 }
 
 cmd_status() {
-  if [ -f "$DIR/key" ]; then echo "Linked, reporting to $(url)."
-  else echo "Not linked. Get a code at $(url)/setup, then /isbusy-code:link <code>."; fi
+  if [ -f "$DIR/key" ]; then
+    echo "Linked, reporting to $(url)."
+    [ -f "$DIR/phone" ] && echo "Permission prompts also go to your phone, sealed."
+  else echo "Not linked. Get a code at $(url)/setup, then /isbusy-code:link <code>; or /isbusy-code:phone for a phone."; fi
 }
 
 case "${1:-}" in
   hook)   shift; cmd_hook "$@" ;;
+  decide) cmd_decide ;;
   link)   shift; cmd_link "$@" ;;
+  phone)  cmd_phone ;;
   unlink) cmd_unlink ;;
   status) cmd_status ;;
-  *) echo "usage: isbusy-code link <code> | unlink | status"; exit 1 ;;
+  *) echo "usage: isbusy-code link <code> | phone | unlink | status"; exit 1 ;;
 esac
