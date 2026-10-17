@@ -4,6 +4,7 @@
 #
 #   isbusy-code link XXXXX-XXXXX   spend a pairing code from code.isbusy.co/setup
 #   isbusy-code phone              pair a phone: shows a QR code for the app
+#   isbusy-code hat [ok]           pair a Game HAT: shows joystick moves
 #   isbusy-code unlink             forget this computer's key
 #   isbusy-code status             is this computer linked?
 #   isbusy-code hook <event>       what the plugin's hooks run; not for people
@@ -260,11 +261,12 @@ cmd_link() {
   echo "Linked to $name. It turns green in new Claude Code sessions; this one catches up on the next prompt."
 }
 
-cmd_phone() {
+# A key and a sealing key, minted if this computer has neither yet - a phone
+# or a HAT needs no light.
+phone_ready() {
   base=$(url)
   mkdir -p "$DIR" && chmod 700 "$DIR"
   if [ ! -f "$DIR/key" ]; then
-    # No light: this computer gets a key of its own.
     reply=$(curl -sS --max-time 15 -w '\n%{http_code}' -H "Content-Type: application/json" \
       -d "{\"label\":\"$(label)\"}" "$base/api/v1/computers") || {
       echo "Could not reach $base. Check your connection and try again."
@@ -278,7 +280,11 @@ cmd_phone() {
     printf %s "$base" > "$DIR/url"
   fi
   [ -f "$DIR/phone" ] || (umask 077 && openssl rand 32 | b64u > "$DIR/phone")
+}
 
+# A one-time phone invite, and what the QR code carries: the relay, the
+# invite, the sealing key and this computer's name. Sets $code and $payload.
+phone_invite() {
   reply=$(curl -sS --max-time 15 -w '\n%{http_code}' -X POST \
     -H "Authorization: Bearer $(cat "$DIR/key")" "$base/api/v1/phones/invite") || {
     echo "Could not reach $base. Check your connection and try again."
@@ -290,6 +296,11 @@ cmd_phone() {
   fi
   code=$(printf %s "$reply" | sed '$d' | field code)
   payload="isbusy-code:pair?u=$base&c=$code&k=$(cat "$DIR/phone")&n=$(label)"
+}
+
+cmd_phone() {
+  phone_ready
+  phone_invite
 
   if command -v qrencode >/dev/null 2>&1; then
     qrencode -t ansiutf8 "$payload"
@@ -342,11 +353,109 @@ EOF
   echo "Opened a QR code in your browser ($page). In the isbusy code app, tap Pair a computer and scan it - it works once, for 15 minutes. /isbusy-code:phone again shows a fresh one."
 }
 
+# ---- a Game HAT: a phone with a joystick and no camera
+#
+# It cannot scan the QR code, so it and this computer agree a key through the
+# relay (P-256, what LibreSSL has), and the person checks nobody sat between
+# them: the HAT committed to its key before seeing ours, so the ten moves
+# both ends derive from the two keys only match if they are the same two keys.
+# Then the person says on this side that the HAT showed a tick, and the QR
+# code's payload goes to the HAT sealed with the agreed key.
+#
+#   commit  sha256(HAT's DER public key), base64url
+#   moves   sha256("isbusy-code hat moves" || ours || HAT's), its first 20
+#           bits two at a time: 0 up, 1 right, 2 down, 3 left
+#   secret  HMAC-SHA256(ECDH x-coordinate, "isbusy-code hat"), base64url;
+#           the payload is sealed with it as with the phone's, aad "hat"
+
+HAT="$DIR/hat"
+
+hat_get() {
+  curl -sS --max-time 10 -H "Authorization: Bearer $(cat "$DIR/key")" "$base/api/v1/hats/pairing/$(cat "$HAT/id")"
+}
+
+hat_moves() {
+  v=$({ printf %s "isbusy-code hat moves"; cat "$HAT/c.der" "$HAT/h.der"; } | openssl dgst -sha256 -binary | head -c 3 | hex)
+  v=$((0x$v)); out=""; i=0
+  while [ $i -lt 10 ]; do
+    case $(( (v >> (22 - 2 * i)) & 3 )) in 0) m="↑" ;; 1) m="→" ;; 2) m="↓" ;; 3) m="←" ;; esac
+    out="$out$m "; i=$((i + 1))
+  done
+  printf %s "${out% }"
+}
+
+cmd_hat() {
+  if [ "${1:-}" = ok ]; then hat_ok; return; fi
+  command -v jq >/dev/null 2>&1 || { echo "Pairing a HAT needs jq."; exit 1; }
+  phone_ready
+  key=$(cat "$DIR/key")
+  found=$(curl -sS --max-time 10 -w '\n%{http_code}' -H "Authorization: Bearer $key" "$base/api/v1/hats/pairing") || {
+    echo "Could not reach $base. Check your connection and try again."
+    exit 1
+  }
+  if [ "$(printf %s "$found" | tail -n 1)" != 200 ]; then
+    echo "No HAT is waiting to pair on this network. Press SELECT and START together on the HAT until it says Pairing, then run /isbusy-code:hat again."
+    exit 1
+  fi
+  rm -rf "$HAT"; (umask 077 && mkdir -p "$HAT")
+  printf %s "$found" | sed '$d' | jq -r .id > "$HAT/id"
+  commit=$(printf %s "$found" | sed '$d' | jq -r .commit)
+  (umask 077 && openssl ecparam -name prime256v1 -genkey -noout -out "$HAT/c.pem")
+  openssl ec -in "$HAT/c.pem" -pubout -outform DER -out "$HAT/c.der" 2>/dev/null
+  reply=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+    -d "{\"pk_c\":\"$(b64u < "$HAT/c.der")\"}" "$base/api/v1/hats/pairing/$(cat "$HAT/id")")
+  [ "$reply" = 200 ] || { echo "Another computer took that HAT first. Run /isbusy-code:hat again."; rm -rf "$HAT"; exit 1; }
+
+  # The HAT answers with its key on its next poll, a second or two.
+  deadline=$(($(date +%s) + 30)); pk_h=""
+  while [ -z "$pk_h" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 1
+    pk_h=$(hat_get | jq -r '.pk_h // empty' 2>/dev/null)
+  done
+  [ -n "$pk_h" ] || { echo "The HAT stopped answering. Run /isbusy-code:hat again."; rm -rf "$HAT"; exit 1; }
+  printf %s "$pk_h" | unb64u > "$HAT/h.der"
+  if [ "$(openssl dgst -sha256 -binary < "$HAT/h.der" | b64u)" != "$commit" ]; then
+    rm -rf "$HAT"
+    echo "The HAT's key is not the one it promised: something between here and the HAT swapped it. Not paired."
+    exit 1
+  fi
+  echo "On the HAT, move:  $(hat_moves)"
+  echo "When the HAT shows a tick, run /isbusy-code:hat ok"
+}
+
+hat_ok() {
+  [ -f "$HAT/h.der" ] && [ -f "$DIR/key" ] || { echo "No HAT pairing in progress. Run /isbusy-code:hat first."; exit 1; }
+  command -v jq >/dev/null 2>&1 || { echo "Pairing a HAT needs jq."; exit 1; }
+  base=$(url)
+  state=$(hat_get)
+  if [ "$(printf %s "$state" | jq -r '.ok // false' 2>/dev/null)" != true ]; then
+    echo "The HAT has not taken the moves yet. Do them on the HAT, wait for the tick, then run /isbusy-code:hat ok again."
+    exit 1
+  fi
+  openssl ec -pubin -inform DER -in "$HAT/h.der" -pubout -out "$HAT/h.pem" 2>/dev/null
+  z=$(openssl pkeyutl -derive -inkey "$HAT/c.pem" -peerkey "$HAT/h.pem" | hex)
+  secret=$(printf %s "isbusy-code hat" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$z" -binary | b64u)
+  phone_invite
+  sealed=$(printf %s "$payload" | seal "$secret" hat)
+  reply=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(cat "$DIR/key")" -H "Content-Type: application/json" \
+    -d "{\"sealed\":\"$sealed\"}" "$base/api/v1/hats/pairing/$(cat "$HAT/id")")
+  rm -rf "$HAT"
+  [ "$reply" = 200 ] || { echo "The relay refused the key (HTTP $reply). Start over with /isbusy-code:hat."; exit 1; }
+  deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    case $(curl -sS --max-time 5 -H "Authorization: Bearer $(cat "$DIR/key")" "$base/api/v1/phones/invite/$code" 2>/dev/null) in
+      *'"paired":true'*) echo "Paired with the HAT. Permission prompts from this computer now go there too."; exit 0 ;;
+    esac
+    sleep 1
+  done
+  echo "Sent the key, but the HAT has not paired yet. Check its screen; /isbusy-code:hat starts over."
+}
+
 cmd_unlink() {
   if [ ! -f "$DIR/key" ]; then echo "This computer is not linked."; exit 0; fi
   curl -fsS --max-time 10 -o /dev/null -X POST -H "Authorization: Bearer $(cat "$DIR/key")" \
     "$(url)/api/v1/unlink" 2>/dev/null
-  rm -f "$DIR/key" "$DIR/phone" "$DIR/pair.html"
+  rm -rf "$DIR/key" "$DIR/phone" "$DIR/pair.html" "$DIR/hat"
   echo "Unlinked. This computer no longer drives the light or asks your phone."
 }
 
@@ -362,7 +471,8 @@ case "${1:-}" in
   decide) cmd_decide ;;
   link)   shift; cmd_link "$@" ;;
   phone)  cmd_phone ;;
+  hat)    shift; cmd_hat "$@" ;;
   unlink) cmd_unlink ;;
   status) cmd_status ;;
-  *) echo "usage: isbusy-code link <code> | phone | unlink | status"; exit 1 ;;
+  *) echo "usage: isbusy-code link <code> | phone | hat [ok] | unlink | status"; exit 1 ;;
 esac

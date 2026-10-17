@@ -10,7 +10,7 @@ sessions: **green** ready for a prompt, **yellow** working, **red** needs you
 /isbusy-code:link XXXXX-XXXXX        # the code from code.isbusy.co/setup
 ```
 
-`/isbusy-code:phone` pairs your phone (below). `/isbusy-code:status` and
+`/isbusy-code:phone` pairs your phone, `/isbusy-code:hat` a Game HAT (below). `/isbusy-code:status` and
 `/isbusy-code:unlink` do what they say.
 
 ## Your phone and watch
@@ -25,6 +25,23 @@ When Claude asks you something instead (its multiple-choice questions), the
 phone shows one question at a time with its options as choices - chips on the
 phone, a list on the watch - plus voice or keyboard for an answer of your own,
 and **Skip**. The answers reach Claude as if picked in the terminal.
+
+## A Game HAT
+
+`/isbusy-code:hat` pairs a Raspberry Pi with a Waveshare Game HAT running
+agent-hat: a phone with a joystick and no camera, so it cannot scan the QR
+code. Put it in pairing mode (it is in it
+when new; SELECT and START together otherwise), run `/isbusy-code:hat` on a
+computer on the same network, and do the ten moves it shows on the HAT's
+joystick. When the HAT shows a tick, run `/isbusy-code:hat ok`.
+
+The moves are the security, not a gimmick. The HAT and this computer agree a
+key through the relay, and the moves are derived from both halves of it: the
+HAT committed to its half before it saw ours, so a relay swapping in keys of
+its own would get different moves, but for one time in about a million. The
+`ok` is you telling this computer the HAT really saw them. Only then does the
+QR code's payload - the invite and the sealing key - go to the HAT, sealed
+with the key they agreed.
 
 A reason reaches Claude as the reason for the denial, not as an instruction:
 Claude Code treats it like any other tool result and will ask you before
